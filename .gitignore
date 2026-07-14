@@ -1,0 +1,55 @@
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environment / secrets (never commit)
+.env
+.env.local
+.env.*.local
+
+# Playwright / browser login sessions (contain cookies & auth)
+.browser_data/
+.whatsapp_data/
+config/wa-auth/
+config/gpt-auth/
+
+# App data / logs
+data/*.db
+data/*.db-*
+data/qa_results.json
+qa_results.json
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# Temp / cache
+*.tmp
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS AppleDouble junk
+._*
