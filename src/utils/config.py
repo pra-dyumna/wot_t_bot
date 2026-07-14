@@ -102,6 +102,10 @@ class Config:
     def get_auto_reply(self) -> bool:
         return _env_bool("AUTO_REPLY", True)
 
+    def get_allow_group_messages(self) -> bool:
+        """Allow reading and replying to group chats when true (env: ALLOW_GROUP_MESSAGES)."""
+        return _env_bool("ALLOW_GROUP_MESSAGES", False)
+
     def get_poll_interval_sec(self) -> float:
         try:
             return float(os.getenv("POLL_INTERVAL_SEC", "2.5"))

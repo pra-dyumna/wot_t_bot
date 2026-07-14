@@ -23,12 +23,42 @@ from src.utils.config import config
 
 WHATSAPP_URL = "https://web.whatsapp.com/"
 
+# Header / list noise that must never be treated as a contact name
+_STATUS_NAMES = {
+    "online",
+    "typing…",
+    "typing...",
+    "typing",
+    "recording…",
+    "recording...",
+    "recording audio…",
+    "unknown",
+    "business account",
+    "you",
+}
+
+
+def _is_status_name(name: str) -> bool:
+    low = (name or "").strip().lower()
+    if not low:
+        return True
+    if low in _STATUS_NAMES:
+        return True
+    if low.startswith("last seen"):
+        return True
+    if low.startswith("typing"):
+        return True
+    if "click here" in low or "contact info" in low:
+        return True
+    return False
+
 
 @dataclass
 class IncomingMessage:
     chat_name: str
     text: str
     fingerprint: str
+    is_group: bool = False
 
 
 def _maybe_migrate_legacy_session(session_dir: Path) -> None:
@@ -69,8 +99,13 @@ class WhatsAppClient:
         self._seen: set[str] = set()
         self._list_previews: dict[str, str] = {}
         self._skip_chats: set[str] = set()
+        # chat_name -> last inbound text we already answered (stops repeat replies)
+        self._replied_to: dict[str, str] = {}
+        # Normalized texts we sent (never treat as inbound)
+        self._outbound_texts: set[str] = set()
         self._ready = False
         self._poll_count = 0
+        self._last_scan_stats: dict[str, int] = {}
 
     @property
     def page(self) -> Page:
@@ -107,7 +142,10 @@ class WhatsAppClient:
             print(f"[wa] preview snapshot failed: {exc}")
         self._ready = True
         print(f"[wa] Ready - listening on account {self.phone}.")
-        print("[wa] Policy: personal unread DMs only (groups ignored). Keep browsers open.")
+        print(
+            "[wa] Policy: personal DMs with unread badge OR new chat-list preview "
+            "(groups ignored). Keep browsers open. Send a NEW message AFTER bot starts."
+        )
 
     def _wait_until_ready(self, timeout_sec: int) -> None:
         print(
@@ -142,8 +180,44 @@ class WhatsAppClient:
             print("[wa] Closed.")
 
     def _fingerprint(self, chat_name: str, text: str) -> str:
-        raw = f"{chat_name}||{text}".strip()
+        raw = f"{chat_name}||{self._normalize_text(text)}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        t = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{2,}", "\n", t)
+        return t.strip().lower()
+
+    def _already_answered(self, chat_name: str, text: str) -> bool:
+        key = self._normalize_text(text)
+        if not key:
+            return False
+        prev = self._replied_to.get(chat_name)
+        if prev and prev == key:
+            return True
+        fp = self._fingerprint(chat_name, text)
+        return fp in self._seen
+
+    def mark_handled(self, message: IncomingMessage) -> None:
+        """Call after a successful reply so the same inbound text is never answered again."""
+        key = self._normalize_text(message.text)
+        self._replied_to[message.chat_name] = key
+        self._seen.add(message.fingerprint or self._fingerprint(message.chat_name, message.text))
+        # Also store preview fingerprints so list fallback cannot retrigger
+        preview = self._list_previews.get(message.chat_name)
+        if preview:
+            self._seen.add(self._fingerprint(message.chat_name, preview))
+        print(f"[wa] marked handled: {message.chat_name!r}")
+
+    def remember_outbound(self, text: str) -> None:
+        """Remember a message we sent so we never feed it back into ChatGPT."""
+        key = self._normalize_text(text)
+        if key:
+            self._outbound_texts.add(key)
+            if len(self._outbound_texts) > 500:
+                self._outbound_texts = set(list(self._outbound_texts)[-300:])
 
     def _is_group_chat(self) -> bool:
         try:
@@ -168,13 +242,30 @@ class WhatsAppClient:
                   if (!main) return '';
                   const header = main.querySelector('header');
                   if (!header) return '';
-                  const titled = header.querySelector('span[title]');
-                  if (titled) {
-                    const t = (titled.getAttribute('title') || titled.textContent || '').trim();
-                    if (t) return t;
+                  // Prefer the conversation title, not subtitle ("click here for contact info")
+                  const titled = [...header.querySelectorAll('span[title]')].map(el => ({
+                    title: (el.getAttribute('title') || '').trim(),
+                    text: (el.textContent || '').trim(),
+                  })).filter(x => x.title || x.text);
+                  for (const x of titled) {
+                    const t = x.title || x.text;
+                    const low = t.toLowerCase();
+                    if (!t) continue;
+                    if (low.includes('click here')) continue;
+                    if (low.includes('contact info')) continue;
+                    if (low === 'business account') continue;
+                    if (low === 'online') continue;
+                    if (low.startsWith('typing')) continue;
+                    if (low.startsWith('last seen')) continue;
+                    if (low.includes('recording')) continue;
+                    if (low.includes('participants') || low.includes('members')) continue;
+                    return t;
                   }
                   const auto = header.querySelector('span[dir="auto"]');
-                  if (auto) return (auto.textContent || '').trim();
+                  if (auto) {
+                    const t = (auto.textContent || '').trim();
+                    if (t && !/click here|contact info|business account|^online$|^typing|^last seen|recording/i.test(t)) return t;
+                  }
                   return '';
                 }"""
             )
@@ -183,12 +274,18 @@ class WhatsAppClient:
         except Exception:
             pass
         try:
-            header = self.page.locator(
-                "#main header span[title], #main header span[dir='auto']"
-            ).first
-            if header.count() > 0:
-                title = header.get_attribute("title") or header.inner_text()
-                return (title or "").strip()
+            spans = self.page.locator("#main header span[title]")
+            n = spans.count()
+            for i in range(n):
+                title = (spans.nth(i).get_attribute("title") or spans.nth(i).inner_text() or "").strip()
+                low = title.lower()
+                if not title:
+                    continue
+                if "click here" in low or "contact info" in low or low == "business account":
+                    continue
+                if _is_status_name(title):
+                    continue
+                return title
         except Exception:
             pass
         return "unknown"
@@ -198,34 +295,118 @@ class WhatsAppClient:
         try:
             text = self.page.evaluate(
                 """() => {
-                  const nodes = [
-                    ...document.querySelectorAll('div.message-in span.selectable-text'),
-                    ...document.querySelectorAll('div.message-in div.copyable-text'),
-                    ...document.querySelectorAll('div.message-in span[data-testid="conversation-text"]'),
-                  ];
-                  for (let i = nodes.length - 1; i >= 0; i--) {
-                    const t = (nodes[i].innerText || nodes[i].textContent || '').trim();
-                    if (t) return t;
+                  const main = document.querySelector('#main');
+                  if (!main) return null;
+
+                  const bad = (t) => {
+                    const s = (t || '').trim();
+                    if (!s) return true;
+                    const low = s.toLowerCase();
+                    if (low === 'today' || low === 'yesterday') return true;
+                    if (/^\\d{1,2}:\\d{2}\\s?(am|pm)?$/i.test(s)) return true;
+                    if (low.includes('click here')) return true;
+                    if (low.includes('tap to')) return true;
+                    if (low.includes('message itself deleted')) return true;
+                    return false;
+                  };
+
+                  const pickLast = (nodes) => {
+                    for (let i = nodes.length - 1; i >= 0; i--) {
+                      const t = (nodes[i].innerText || nodes[i].textContent || '').trim();
+                      if (!bad(t)) return t;
+                    }
+                    return null;
+                  };
+
+                  // 1) Classic WhatsApp Web incoming bubbles
+                  let hit = pickLast([
+                    ...main.querySelectorAll('div.message-in span.selectable-text'),
+                    ...main.querySelectorAll('div.message-in span.copyable-text'),
+                    ...main.querySelectorAll('div.message-in div.copyable-text'),
+                    ...main.querySelectorAll('div.message-in span[data-testid="conversation-text"]'),
+                  ]);
+                  if (hit) return hit;
+
+                  // 2) Any selectable-text not inside an outgoing bubble
+                  hit = pickLast(
+                    [...main.querySelectorAll('span.selectable-text, span.copyable-text, span[data-testid="conversation-text"]')]
+                      .filter(el => !el.closest('div.message-out') && !el.closest('footer') && !el.closest('header'))
+                  );
+                  if (hit) return hit;
+
+                  // 3) data-pre-plain-text rows (often on copyable-text wrappers)
+                  const prefs = [...main.querySelectorAll('[data-pre-plain-text]')];
+                  for (let i = prefs.length - 1; i >= 0; i--) {
+                    const el = prefs[i];
+                    if (el.closest('div.message-out')) continue;
+                    const t = (el.innerText || el.textContent || '').trim();
+                    if (!bad(t)) return t;
+                  }
+
+                  // 4) Messages with data-id (incoming usually true_... or ! from-me patterns)
+                  const rows = [...main.querySelectorAll('div[data-id]')];
+                  for (let i = rows.length - 1; i >= 0; i--) {
+                    const row = rows[i];
+                    const id = row.getAttribute('data-id') || '';
+                    if (row.classList.contains('message-out')) continue;
+                    if (/^false_/.test(id)) continue; // often own messages
+                    if (row.querySelector('div.message-out')) continue;
+                    const span = row.querySelector('span.selectable-text, span.copyable-text, span[dir="ltr"], span[dir="auto"]');
+                    if (!span) continue;
+                    const t = (span.innerText || span.textContent || '').trim();
+                    if (!bad(t)) return t;
+                  }
+
+                  // 5) Last focusable chat row text blob (last resort)
+                  const focus = [...main.querySelectorAll('div.focusable-list-item, div[role="row"]')];
+                  for (let i = focus.length - 1; i >= 0; i--) {
+                    const row = focus[i];
+                    if (row.closest('footer') || row.closest('header')) continue;
+                    if (row.querySelector('div.message-out')) continue;
+                    const t = (row.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                    // drop time-only trailing lines
+                    while (t.length && /^\\d{1,2}:\\d{2}/.test(t[t.length - 1])) t.pop();
+                    const body = t.join(' ').trim();
+                    if (!bad(body) && body.length > 0 && body.length < 4000) return body;
                   }
                   return null;
                 }"""
             )
             if text:
                 return str(text).strip()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[wa] text extract error: {exc}")
+
         selectors = [
-            "div.message-in span.selectable-text",
-            "div.message-in div.copyable-text",
-            "div.message-in span[data-testid='conversation-text']",
+            "#main div.message-in span.selectable-text",
+            "#main div.message-in span.copyable-text",
+            "#main span.selectable-text",
+            "#main [data-pre-plain-text]",
+            "#main div[data-id] span.selectable-text",
         ]
         for sel in selectors:
-            nodes = self.page.locator(sel)
-            n = nodes.count()
-            if n > 0:
-                t = nodes.nth(n - 1).inner_text().strip()
-                if t:
-                    return t
+            try:
+                nodes = self.page.locator(sel)
+                n = nodes.count()
+                if n > 0:
+                    t = nodes.nth(n - 1).inner_text().strip()
+                    if t and t.lower() not in {"today", "yesterday"}:
+                        return t
+            except Exception:
+                continue
+        return None
+
+    def _preview_for_name(self, name: str) -> str | None:
+        """Chat-list last-message preview for a contact (fallback when bubbles unreadable)."""
+        preview = (self._list_previews.get(name) or "").strip()
+        if preview:
+            return preview
+        for row in self._chat_list_rows():
+            if row.get("name") == name:
+                p = (row.get("preview") or "").strip()
+                if p:
+                    self._list_previews[name] = p
+                    return p
         return None
 
     def _chat_list_rows(self) -> list[dict]:
@@ -238,13 +419,51 @@ class WhatsAppClient:
                   const pane = document.querySelector('#pane-side');
                   if (!pane) return out;
 
+                  const isUnread = (row, label) => {
+                    if (/\\bunread\\b/i.test(label)) return true;
+                    if (/\\d+\\s+unread/i.test(label)) return true;
+                    if (row.querySelector('[data-testid="icon-unread-count"]')) return true;
+                    if (row.querySelector('[data-testid="unread-count"]')) return true;
+                    if (row.querySelector('[data-testid="icon-unread-mention"]')) return true;
+                    if (row.querySelector('[data-icon="unread-count"]')) return true;
+                    if (row.querySelector('[aria-label*="unread" i]')) return true;
+                    // Green / teal unread badge: small numeric pill next to time
+                    const badges = row.querySelectorAll('span, div');
+                    for (const b of badges) {
+                      const t = (b.textContent || '').trim();
+                      if (!/^\\d{1,3}$/.test(t)) continue;
+                      const al = (b.getAttribute('aria-label') || '').toLowerCase();
+                      if (al.includes('unread') || al.includes('mention')) return true;
+                      // Typical WA badge is a short digit with no title attribute
+                      if (!b.getAttribute('title') && t.length <= 3) {
+                        const style = window.getComputedStyle(b);
+                        const bg = (style.backgroundColor || '').replace(/\\s/g, '');
+                        // WhatsApp unread is often green-ish (approximate)
+                        if (/rgba?\\((0|\\d+),\\s?(12[0-9]|13[0-9]|14[0-9]|1[5-9]\\d|2\\d\\d),/.test(bg)) return true;
+                        if (bg.includes('37,211,102') || bg.includes('0,168,132') || bg.includes('25,211,102')) return true;
+                      }
+                    }
+                    return false;
+                  };
+
+                  const previewFrom = (row, name) => {
+                    const lines = (row.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                    // Prefer a line that is not the contact name and not a bare time
+                    for (const line of lines) {
+                      if (!line || line === name) continue;
+                      if (/^\\d{1,2}:\\d{2}/.test(line)) continue;
+                      if (/^(today|yesterday)$/i.test(line)) continue;
+                      return line;
+                    }
+                    return lines.length >= 2 ? lines[1] : '';
+                  };
+
                   // WhatsApp Web DOM changes often — try several row shapes
                   let rowNodes = [...pane.querySelectorAll('[role="listitem"]')];
                   if (rowNodes.length === 0) {
                     rowNodes = [...pane.querySelectorAll('div[data-testid="cell-frame-container"]')];
                   }
                   if (rowNodes.length === 0) {
-                    // Fallback: any element in pane that has a titled contact span
                     const titles = pane.querySelectorAll('span[title]');
                     for (const titleEl of titles) {
                       const name = (titleEl.getAttribute('title') || '').trim();
@@ -257,14 +476,10 @@ class WhatsAppClient:
                       if (!row) continue;
                       const label = (row.getAttribute('aria-label') || '') + ' ' + (row.innerText || '');
                       if (/\\d+\\s+(participants|members)/i.test(label)) continue;
-                      const lines = (row.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
-                      const preview = lines.length >= 2 ? lines[1] : '';
-                      const unread =
-                        /\\bunread\\b/i.test(label) ||
-                        !!row.querySelector('[data-testid="icon-unread-count"]') ||
-                        !!row.querySelector('span[aria-label*="unread" i]');
+                      const preview = previewFrom(row, name);
+                      const unread = isUnread(row, label);
                       seen.add(name);
-                      out.push({ name, preview, unread: !!unread, label });
+                      out.push({ name, preview, unread: !!unread, label: label.slice(0, 200) });
                     }
                     return out;
                   }
@@ -275,14 +490,10 @@ class WhatsAppClient:
                     const titleEl = row.querySelector('span[title]');
                     const name = (titleEl && (titleEl.getAttribute('title') || titleEl.textContent) || '').trim();
                     if (!name || seen.has(name)) continue;
-                    const lines = (row.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
-                    const preview = lines.length >= 2 ? lines[1] : '';
-                    const unread =
-                      /\\bunread\\b/i.test(label) ||
-                      !!row.querySelector('[data-testid="icon-unread-count"]') ||
-                      !!row.querySelector('span[aria-label*="unread" i]');
+                    const preview = previewFrom(row, name);
+                    const unread = isUnread(row, label);
                     seen.add(name);
-                    out.push({ name, preview, unread: !!unread, label });
+                    out.push({ name, preview, unread: !!unread, label: label.slice(0, 200) });
                   }
                   return out;
                 }"""
@@ -302,91 +513,243 @@ class WhatsAppClient:
             return True
         if name.isupper() and len(name) > 20:
             return True
+        group_keywords = (
+            "community",
+            "discussion",
+            "gossip",
+            "job opening",
+            "world",
+            "channel",
+            "broadcast",
+            "invest",
+            "eagles",
+        )
+        if any(k in blob for k in group_keywords):
+            return True
+        if " - " in name and len(name) > 22:
+            return True
         return False
+
+    def _looks_like_personal_name(self, name: str) -> bool:
+        if not name or _is_status_name(name) or self._looks_like_group_name(name):
+            return False
+        parts = [p for p in re.split(r"\s+", name.strip()) if p]
+        if not parts or len(parts) > 4 or len(name) > 40:
+            return False
+        if re.search(r"[\U0001F300-\U0001FAFF]", name):
+            return False
+        return True
 
     def _click_chat_in_list(self, name: str) -> bool:
         """Open a chat by clicking its row in the left list (no search box)."""
         try:
-            ok = self.page.evaluate(
-                """(name) => {
-                  const pane = document.querySelector('#pane-side');
-                  if (!pane) return false;
-                  const titles = pane.querySelectorAll('span[title]');
-                  for (const el of titles) {
-                    const t = (el.getAttribute('title') || el.textContent || '').trim();
-                    if (t !== name) continue;
-                    const row =
-                      el.closest('[role="listitem"]') ||
-                      el.closest('div[data-testid="cell-frame-container"]') ||
-                      el.parentElement;
-                    if (row) { row.click(); return true; }
-                    el.click();
-                    return true;
-                  }
-                  return false;
-                }""",
-                name,
-            )
-            if ok:
-                self.page.wait_for_timeout(1000)
-            return bool(ok)
+            exact = self.page.locator(f'#pane-side span[title="{name}"]')
+            if exact.count() == 0:
+                ok = self.page.evaluate(
+                    """(name) => {
+                      const pane = document.querySelector('#pane-side');
+                      if (!pane) return false;
+                      for (const el of pane.querySelectorAll('span[title]')) {
+                        const t = (el.getAttribute('title') || '').trim();
+                        if (t !== name) continue;
+                        const row =
+                          el.closest('[role="listitem"]') ||
+                          el.closest('div[data-testid="cell-frame-container"]');
+                        (row || el).click();
+                        return true;
+                      }
+                      return false;
+                    }""",
+                    name,
+                )
+                if not ok:
+                    return False
+            else:
+                # Click the list row, not only the tiny title span
+                clicked = self.page.evaluate(
+                    """(name) => {
+                      const pane = document.querySelector('#pane-side');
+                      if (!pane) return false;
+                      for (const el of pane.querySelectorAll('span[title]')) {
+                        if ((el.getAttribute('title') || '').trim() !== name) continue;
+                        const row =
+                          el.closest('[role="listitem"]') ||
+                          el.closest('div[data-testid="cell-frame-container"]');
+                        (row || el).dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+                        (row || el).dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
+                        (row || el).click();
+                        return true;
+                      }
+                      return false;
+                    }""",
+                    name,
+                )
+                if not clicked:
+                    exact.first.click(timeout=5000)
+
+            self.page.wait_for_timeout(1500)
+            try:
+                self.page.locator("#main header").first.wait_for(state="visible", timeout=8000)
+            except Exception:
+                pass
+            active = self._active_chat_name()
+            # Subtitle-only headers still mean the chat pane opened
+            if active == "unknown":
+                # Fallback: conversation composer visible?
+                composer = self.page.locator(
+                    "footer div[contenteditable='true'], #main div[contenteditable='true'][role='textbox']"
+                )
+                if composer.count() > 0 and composer.first.is_visible():
+                    print(f"[wa] click '{name}' — chat pane open (header unknown)")
+                    return True
+                print(f"[wa] click '{name}' done but header still unknown")
+                return False
+            if active == name or name.lower() in active.lower() or active.lower() in name.lower():
+                return True
+            if "click here" in active.lower() or "contact info" in active.lower() or active.lower() == "business account":
+                # Wrong subtitle read — pane is still likely the opened chat
+                return True
+            print(f"[wa] opened header={active!r} expected={name!r}")
+            return True
         except Exception as exc:
             print(f"[wa] click list '{name}' failed: {exc}")
             return False
 
+    @staticmethod
+    def _is_own_list_preview(preview: str) -> bool:
+        p = (preview or "").strip().lower()
+        return p.startswith("you:") or p.startswith("you :") or p.startswith("you\u200e:")
+
     def _chats_to_check(self) -> list[str]:
         """
-        Personal chats with an UNSEEN/unread badge only.
-        Groups are skipped. No contact-name special cases.
+        Personal chats that need a reply:
+        - unread badge, OR
+        - chat-list preview text changed since last poll (phone often clears unread)
+        Groups are skipped. Person-style names are checked first.
         """
-        names: list[str] = []
+        personal: list[str] = []
+        other: list[str] = []
         seen: set[str] = set()
-        for row in self._chat_list_rows():
+        unread_n = 0
+        changed_n = 0
+        try:
+            allow_groups = config.get_allow_group_messages()
+        except Exception:
+            allow_groups = False
+
+        rows = self._chat_list_rows()
+        for row in rows:
             name = row.get("name") or ""
             preview = (row.get("preview") or "").strip()
             label = row.get("label") or ""
             unread = bool(row.get("unread"))
-            if not name or name in self._skip_chats:
+            if not name or name in self._skip_chats or _is_status_name(name):
                 continue
             if self._looks_like_group_name(name, label):
-                self._skip_chats.add(name)
+                if not allow_groups:
+                    self._skip_chats.add(name)
+                    continue
+
+            old = self._list_previews.get(name)
+            # First time we see this name after start — remember, don't fire yet
+            if old is None:
+                self._list_previews[name] = preview
                 continue
-            # Always keep preview map updated so later unread detection stays stable
+
+            changed = bool(
+                preview
+                and self._normalize_text(preview) != self._normalize_text(old)
+            )
             self._list_previews[name] = preview
-            if not unread:
+
+            if unread:
+                unread_n += 1
+            if changed:
+                changed_n += 1
+
+            # Own outbound in the list must never trigger a GPT reply
+            if self._is_own_list_preview(preview):
+                continue
+            if preview and self._normalize_text(preview) in self._outbound_texts:
+                continue
+
+            if not unread and not changed:
+                continue
+            # Already answered this exact preview/text — wait for a NEW user message
+            if preview and self._already_answered(name, preview):
                 continue
             if name in seen:
                 continue
             seen.add(name)
-            names.append(name)
-            if len(names) >= 5:
-                break
-        return names
+            if self._looks_like_personal_name(name):
+                personal.append(name)
+            else:
+                other.append(name)
 
-    def _collect_from_open_chat(self, force: bool = False) -> IncomingMessage | None:
-        if self._is_group_chat():
+        # Stash last scan stats for heartbeat
+        self._last_scan_stats = {
+            "rows": len(rows),
+            "unread": unread_n,
+            "changed": changed_n,
+            "queued": len(personal) + len(other),
+        }
+        return (personal + other)[:5]
+
+    def _collect_from_open_chat(
+        self, force: bool = False, expected_name: str | None = None
+    ) -> IncomingMessage | None:
+        # Determine whether this open chat is a group
+        is_group = self._is_group_chat()
+        try:
+            allow_groups = config.get_allow_group_messages()
+        except Exception:
+            allow_groups = False
+
+        if is_group and not allow_groups:
             name = self._active_chat_name()
             if name and name != "unknown":
                 self._skip_chats.add(name)
             return None
         chat_name = self._active_chat_name()
-        if not chat_name or chat_name == "unknown":
+        # Prefer the contact we intentionally opened (header DOM often shows subtitle first)
+        if expected_name:
+            if (
+                not chat_name
+                or chat_name == "unknown"
+                or "click here" in chat_name.lower()
+                or "contact info" in chat_name.lower()
+                or chat_name.lower() == "business account"
+            ):
+                chat_name = expected_name
+            elif expected_name.lower() not in chat_name.lower() and chat_name.lower() not in expected_name.lower():
+                chat_name = expected_name
+        if not chat_name or chat_name == "unknown" or _is_status_name(chat_name):
             return None
-        if self._looks_like_group_name(chat_name):
+        if self._looks_like_group_name(chat_name) and not allow_groups:
             self._skip_chats.add(chat_name)
             return None
         text = self._last_incoming_text()
+        if not text and expected_name:
+            # Fallback: unread list preview (still enough to ask ChatGPT)
+            text = self._preview_for_name(expected_name)
+            if text:
+                print(f"[wa] using chat-list preview for {expected_name!r}: {text[:80]!r}")
         if not text:
-            if self._poll_count % 8 == 0:
-                print(f"[wa] open chat {chat_name!r} but no incoming text found")
+            print(f"[wa] open chat {chat_name!r} but no incoming text found")
+            return None
+        # Never re-process our own outbound WhatsApp messages
+        if self._normalize_text(text) in self._outbound_texts:
+            return None
+        if self._already_answered(chat_name, text):
             return None
         fp = self._fingerprint(chat_name, text)
-        if not force and fp in self._seen:
+        # Never bypass handled/seen — force only retries empty-text cases above
+        if fp in self._seen:
             return None
         self._seen.add(fp)
         if len(self._seen) > 2000:
             self._seen = set(list(self._seen)[-1000:])
-        return IncomingMessage(chat_name=chat_name, text=text, fingerprint=fp)
+        return IncomingMessage(chat_name=chat_name, text=text, fingerprint=fp, is_group=is_group)
 
     def poll_new_messages(self) -> list[IncomingMessage]:
         if not self._ready:
@@ -397,13 +760,41 @@ class WhatsAppClient:
 
         to_open = self._chats_to_check()
         if to_open:
-            print(f"[wa] unread personal chats: {', '.join(to_open)}")
+            print(f"[wa] chats needing reply: {', '.join(to_open)}")
 
         for name in to_open:
             try:
-                if not self._click_chat_in_list(name):
-                    self.open_chat_by_name(name)
-                msg = self._collect_from_open_chat()
+                # Refresh preview from list before opening (fallback for AI prompt)
+                self._preview_for_name(name)
+                opened = False
+                try:
+                    opened = self._click_chat_in_list(name)
+                except Exception:
+                    opened = False
+                if not opened:
+                    opened = self.open_chat_by_name(name)
+                if not opened:
+                    print(f"[wa] could not open chat '{name}' — trying preview-only reply")
+                    preview = self._preview_for_name(name)
+                    if preview and not self._already_answered(name, preview):
+                        fp = self._fingerprint(name, preview)
+                        if fp not in self._seen:
+                            self._seen.add(fp)
+                            found.append(
+                                IncomingMessage(
+                                    chat_name=name, text=preview, fingerprint=fp, is_group=False
+                                )
+                            )
+                    continue
+
+                msg = self._collect_from_open_chat(expected_name=name)
+                if not msg:
+                    self.page.wait_for_timeout(900)
+                    msg = self._collect_from_open_chat(force=True, expected_name=name)
+                if not msg:
+                    self.page.wait_for_timeout(700)
+                    msg = self._collect_from_open_chat(force=True, expected_name=name)
+
                 if msg:
                     found.append(msg)
             except Exception as exc:
@@ -413,7 +804,12 @@ class WhatsAppClient:
         try:
             active = self._active_chat_name()
             if self._poll_count % 8 == 0:
-                print(f"[wa] heartbeat open_chat={active!r} group={self._is_group_chat()}")
+                st = self._last_scan_stats or {}
+                print(
+                    f"[wa] heartbeat open_chat={active!r} group={self._is_group_chat()} "
+                    f"rows={st.get('rows', 0)} unread={st.get('unread', 0)} "
+                    f"changed={st.get('changed', 0)} queued={st.get('queued', 0)}"
+                )
             msg = self._collect_from_open_chat()
             if msg and all(m.fingerprint != msg.fingerprint for m in found):
                 found.append(msg)
@@ -449,7 +845,10 @@ class WhatsAppClient:
 
         self.page.wait_for_timeout(500)
         chat_name = self._active_chat_name()
+        if _is_status_name(chat_name):
+            chat_name = "me"
         self._seen.add(self._fingerprint(chat_name, body))
+        self.remember_outbound(body)
 
     def open_chat_by_name(self, name: str) -> bool:
         if self._click_chat_in_list(name):
@@ -499,12 +898,17 @@ class WhatsAppClient:
 
     def reply(self, message: IncomingMessage, reply_text: str) -> None:
         current = self._active_chat_name()
-        if current != message.chat_name:
+        if _is_status_name(current) or (
+            current != message.chat_name
+            and message.chat_name.lower() not in current.lower()
+            and current.lower() not in message.chat_name.lower()
+        ):
             if not self._click_chat_in_list(message.chat_name) and not self.open_chat_by_name(
                 message.chat_name
             ):
                 raise RuntimeError(f"Could not open chat: {message.chat_name}")
         self.send_message_to_active_chat(reply_text)
+        self.remember_outbound(reply_text)
 
     def run_forever(self, on_message: Callable[[IncomingMessage], None]) -> None:
         from playwright.sync_api import Error as PlaywrightError
@@ -518,7 +922,14 @@ class WhatsAppClient:
                     )
                 messages = self.poll_new_messages()
                 for msg in messages:
-                    print(f"[wa] <- {msg.chat_name}: {msg.text[:120]}")
+                    tag = "[group] " if getattr(msg, "is_group", False) else ""
+                    print(f"[wa] {tag}<- {msg.chat_name}: {msg.text[:120]}")
+                    # Simple group notification detection
+                    try:
+                        if getattr(msg, "is_group", False) and re.search(r"\b(left|removed|added|joined)\b", msg.text, re.I):
+                            print(f"[wa] [group-notify] {msg.chat_name}: {msg.text[:160]}")
+                    except Exception:
+                        pass
                     on_message(msg)
                 self.page.wait_for_timeout(int(self.poll_interval_sec * 1000))
             except PlaywrightError as exc:
